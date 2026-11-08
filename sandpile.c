@@ -105,18 +105,19 @@ static void stabilize() {
     changed = 0;
     for (int i = 0; i < N; ++i) {
       for (int j = row_low[i]; j <= row_high[i]; ++j) { // CHANGED: was j = 0 to MAX(i, N-1-i) + per-cell circle test
-        if (grid[i][j] < 4)
-          continue;
-        changed = 1; // topple it
-        grid[i][j] -= 4;
+        // REMOVED: unpredictable branch
+
+        int t = grid[i][j] >> 2; // ADDED: # of topples
+        changed |= t; // CHANGED: topple it
+        grid[i][j] -= 4 * t; // CHANGED: removes 4 grains per topple
         if (i > 0)
-          grid[i - 1][j]++;
+          grid[i - 1][j] += t; // CHANGED: adds 1 grain per topple to each neighbor
         if (j > 0)
-          grid[i][j - 1]++;
+          grid[i][j - 1] += t; // CHANGED: adds 1 grain per topple to each neighbor
         if (i < N - 1)
-          grid[i + 1][j]++;
+          grid[i + 1][j] += t; // CHANGED: adds 1 grain per topple to each neighbor
         if (j < N - 1)
-          grid[i][j + 1]++;
+          grid[i][j + 1] += t; // CHANGED: adds 1 grain per topple to each neighbor
       }
     }
   } while (changed);
