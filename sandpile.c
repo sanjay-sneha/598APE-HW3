@@ -21,6 +21,33 @@ static void die(const char *s) {
 int N = 801;
 int **grid;
 
+// ADDED: per-row shape bound pointers
+static int* row_low;
+static int* row_high;
+
+// ADDED: precompute shape bounds
+static void compute_shape(void) {
+  row_low = (int*) malloc(N * sizeof(int));
+  row_high = (int*) malloc(N * sizeof(int));
+  if (!row_low || !row_high)
+    die("Malloc failed for shape bounds");
+  int c = N / 2;
+  for (int i = 0; i < N; ++i) {
+    int low = -1, high = -1; // empty row by default
+    int jmax = MAX(i, N - 1 - i); // mouth cutoff
+    for (int j = 0; j <= jmax; ++j) {
+      // circle test run only once
+      if ((i - c) * (i - c) + (j - c) * (j - c) <= c * c) {
+        if (low < 0)
+          low = j;
+        high = j;
+      }
+    }
+    row_low[i] = (low < 0) ? 0 : low;
+    row_high[i] = high;
+  }
+}
+
 // you can also use this function to debug print your sandpile
 static void render(char *filename) {
   int chan = 3;
@@ -77,22 +104,19 @@ static void stabilize() {
   do {
     changed = 0;
     for (int i = 0; i < N; ++i) {
-      for (int j = 0; j <= MAX(i, N - 1 - i); ++j) {
-        if ((i - N / 2) * (i - N / 2) + (j - N / 2) * (j - N / 2) <=
-            (N / 2) * (N / 2)) {
-          if (grid[i][j] < 4)
-            continue;
-          changed = 1; // topple it
-          grid[i][j] -= 4;
-          if (i > 0)
-            grid[i - 1][j]++;
-          if (j > 0)
-            grid[i][j - 1]++;
-          if (i < N - 1)
-            grid[i + 1][j]++;
-          if (j < N - 1)
-            grid[i][j + 1]++;
-        }
+      for (int j = row_low[i]; j <= row_high[i]; ++j) { // CHANGED: was j = 0 to MAX(i, N-1-i) + per-cell circle test
+        if (grid[i][j] < 4)
+          continue;
+        changed = 1; // topple it
+        grid[i][j] -= 4;
+        if (i > 0)
+          grid[i - 1][j]++;
+        if (j > 0)
+          grid[i][j - 1]++;
+        if (i < N - 1)
+          grid[i + 1][j]++;
+        if (j < N - 1)
+          grid[i][j + 1]++;
       }
     }
   } while (changed);
@@ -130,6 +154,7 @@ int main(int argc, char **argv) {
     grid[i] = (int *)malloc(N * sizeof(int));
   }
 
+  compute_shape(); // ADDED: precompute shape bounds only once
   find_identity();
 
   render("identity.png");
@@ -137,5 +162,7 @@ int main(int argc, char **argv) {
     free(grid[i]);
   }
   free(grid);
+  free(row_low); // ADDED: free shape bounds
+  free(row_high); // ADDED: free shape bounds
   return EXIT_SUCCESS;
 }
