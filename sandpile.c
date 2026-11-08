@@ -19,7 +19,15 @@ static void die(const char *s) {
 }
 
 int N = 801;
-int* grid; // CHANGED: a contiguous block of (N+2)*(N+2) ints
+// ADDED: cell type
+// cells inside the shape never go above 7, but cells outside the shape (the sink)
+// keep collecting grains which measured to fit easily in int16
+// half the bytes means half the memory traffic and twice as many cells per vector instruction
+typedef int16_t cell_t;
+// ADDED: largest N where the sink values fit in int16
+// for bigger N have to change cell_t back to int32_t
+#define MAX_N_INT16 2001
+cell_t* grid; // CHANGED: a contiguous block of (N+2)*(N+2) ints
 
 // ADDED:
 // grid has a 1-cell border of padding on every side, so cell (i, j) of the
@@ -30,7 +38,7 @@ int* grid; // CHANGED: a contiguous block of (N+2)*(N+2) ints
 
 // ADDED: topple count per cell for the current sweep, same padded layout as grid
 // only cells inside the shape are ever written, so every other entry stays 0
-static int* tbuf;
+static cell_t* tbuf; // CHANGED: cell_t defining which type of int
 
 // ADDED: per-row shape bound pointers
 static int* row_low;
@@ -137,8 +145,8 @@ static void stabilize() {
   // every cell because a write to grid[...] might have changed them)
   const int N_local = N;
   const int W = N + 2; // width of one padded row
-  int* restrict g = grid; // g is the only pointer used to write the grid
-  int* restrict tb = tbuf; // ADDED: only pointer used to write the topple counts
+  cell_t* restrict g = grid; // g is the only pointer used to write the grid, changed to cell_t
+  cell_t* restrict tb = tbuf; // ADDED: only pointer used to write the topple counts, changed to cell_t
   const int* low = row_low;
   const int* high = row_high;
   const int* rlow = recv_low; // ADDED: local copy of recv bounds
@@ -170,20 +178,24 @@ static void stabilize() {
       #pragma omp for reduction(|:changed) schedule(static, 16)
 
       for (int i = 0; i < rows; ++i) { // CHANGED: use local copy, only top half + middle row
-        int* restrict row = g + (i + 1) * W + 1; // ADDED: pointer to cell (i, 0) so row[j] is cell (i, j)
-        int* restrict trow = tb + (i + 1) * W + 1; // ADDED: same for the topple counts
+        cell_t* restrict row = g + (i + 1) * W + 1; // ADDED: pointer to cell (i, 0) so row[j] is cell (i, j), changed to cell_t
+        cell_t* restrict trow = tb + (i + 1) * W + 1; // ADDED: same for the topple counts, changed to cell_t
         const int jlow = low[i], jhigh = high[i]; // ADDED: read the row bounds once so gcc knows the trip count
+        // ADDED: per-row stop flag since updating the shared openmp reduction variable changed inside the
+        // inner loop stopped gcc from vectorizing pass 1, so collect it per row and merge it once per row instead
+        int row_changed = 0;
 
         for (int j = jlow; j <= jhigh; ++j) { // CHANGED: use local copy, was j = 0 to MAX(i, N-1-i) + per-cell circle test
           // REMOVED: unpredictable branch
 
-          int t = row[j] >> 2; // ADDED: # of topples
-          changed |= t; // CHANGED: topple it
+          cell_t t = row[j] >> 2; // ADDED: # of topples, changed to cell_t
+          row_changed |= t; // CHANGED: topple it
           row[j] -= 4 * t; // CHANGED: removes 4 grains per topple
           trow[j] = t; // ADDED: save t so pass 2 can hand it to neighbors
           // REMOVED: removed boundary checks since edge grains now land in the padding border
           // REMOVED: also the neighbor adds which are done in pass 2
         }
+        changed |= row_changed; // ADDED: merge the per-row flag once per row
       }
       // ADDED: every thread copies the final changed now (all threads wait at the end of pass 1
       // so it's complete) and reading it after pass 2 instead could race with the next sweep resetting it
@@ -196,10 +208,10 @@ static void stabilize() {
       // the wait at the end of pass 1 makes sure all topple counts are saved before pass 2 reads them
       #pragma omp for schedule(static, 16)
       for (int i = 0; i < rows; ++i) { // CHANGED: only top half + middle row
-        int* restrict row = g + (i + 1) * W + 1;
-        const int* restrict trow = tb + (i + 1) * W + 1;
-        const int* restrict tup = trow - W; // ADDED: topple counts of the row above
-        const int* restrict tdown = (sym && i == c) ? tup : trow + W; // ADDED: topple counts of the row below
+        cell_t* restrict row = g + (i + 1) * W + 1; // CHANGED: changed to cell_t
+        const cell_t* restrict trow = tb + (i + 1) * W + 1; // CHANGED: changed to cell_t
+        const cell_t* restrict tup = trow - W; // ADDED: topple counts of the row above, changed to cell_t
+        const cell_t* restrict tdown = (sym && i == c) ? tup : trow + W; // ADDED: topple counts of the row below, changed to cell_t
         // for the middle row that's row c+1, which isn't simulated, but it's the mirror of row c-1 so read that instead
         const int jlow = rlow[i], jhigh = rhigh[i];
 
@@ -232,7 +244,7 @@ void find_identity() {
   // so copy each bottom row from its mirror row in the top half (whole padded row at once)
   if (N % 2 == 1) {
     for (int i = N / 2 + 1; i < N; ++i)
-      memcpy(&grid[IDX(i, -1)], &grid[IDX(N - 1 - i, -1)], (size_t)(N + 2) * sizeof(int));
+      memcpy(&grid[IDX(i, -1)], &grid[IDX(N - 1 - i, -1)], (size_t) (N + 2) * sizeof(cell_t)); // CHANGED: changed to cell_t
   }
 }
 
@@ -247,14 +259,17 @@ int main(int argc, char **argv) {
       parsed > INT32_MAX)
     die("grid size must be a positive int");
   N = (int)parsed;
+  // ADDED: instead of giving a wrong image, guard to refuse sizes where the sink values might not fit in int16
+  if (sizeof(cell_t) == 2 && N > MAX_N_INT16)
+    die("N too large for int16 cells, change cell_t to int32_t");
 
   // REMOVED: mallocs for grid and each row
   // ADDED: one alloc for the whole padded grid, calloc zeroes it so the border starts at 0
-  grid = (int*) calloc((size_t) (N + 2) * (N + 2), sizeof(int));
+  grid = (cell_t*) calloc((size_t) (N + 2) * (N + 2), sizeof(cell_t)); // CHANGED: changed to cell_t
   if (!grid)
     die("calloc failed for grid");
   // ADDED: topple counts, calloc zeroes them so cells outside the shape always give 0
-  tbuf = (int*) calloc((size_t) (N + 2) * (N + 2), sizeof(int));
+  tbuf = (cell_t*) calloc((size_t) (N + 2) * (N + 2), sizeof(cell_t)); // CHANGED: changed to cell_t
   if (!tbuf)
     die("calloc failed for topple buffer");
 
