@@ -19,7 +19,14 @@ static void die(const char *s) {
 }
 
 int N = 801;
-int **grid;
+int* grid; // CHANGED: a contiguous block of (N+2)*(N+2) ints
+
+// ADDED:
+// grid has a 1-cell border of padding on every side, so cell (i, j) of the
+// N x N sandpile lives at row i+1, column j+1 of the padded grid
+// grains that fall off the edge land in the border, which is never rendered,
+// so this works for disappearing grains that fall off
+#define IDX(i, j) (((i) + 1) * (N + 2) + ((j) + 1))
 
 // ADDED: per-row shape bound pointers
 static int* row_low;
@@ -58,7 +65,7 @@ static void render(char *filename) {
   for (int i = 0; i < N; ++i) {
     for (int j = 0; j < N; ++j) {
       unsigned char r = 0, g = 0, b = 0;
-      switch (grid[i][j]) {
+      switch (grid[IDX(i, j)]) { // CHANGED: flat padded array idx
       case 0: // obsidian
         r = 15;
         g = 15;
@@ -100,24 +107,31 @@ static void render(char *filename) {
 }
 
 static void stabilize() {
+  // local copies so the compiler knows they can't change while we write to
+  // the grid (before, re-read N and the row pointers from memory for
+  // every cell because a write to grid[...] might have changed them)
+  const int N_local = N;
+  const int W = N + 2; // width of one padded row
+  int* restrict g = grid; // g is the only pointer used to write the grid
+  const int* low = row_low;
+  const int* high = row_high;
+
   int changed = 0;
   do {
     changed = 0;
-    for (int i = 0; i < N; ++i) {
-      for (int j = row_low[i]; j <= row_high[i]; ++j) { // CHANGED: was j = 0 to MAX(i, N-1-i) + per-cell circle test
+    for (int i = 0; i < N_local; ++i) { // CHANGED: use local copy
+      int* row = g + (i + 1) * W + 1; // ADDED: pointer to cell (i, 0) so row[j] is cell (i, j)
+      for (int j = low[i]; j <= high[i]; ++j) { // CHANGED: use local copy, was j = 0 to MAX(i, N-1-i) + per-cell circle test
         // REMOVED: unpredictable branch
 
-        int t = grid[i][j] >> 2; // ADDED: # of topples
+        int t = row[j] >> 2; // ADDED: # of topples
         changed |= t; // CHANGED: topple it
-        grid[i][j] -= 4 * t; // CHANGED: removes 4 grains per topple
-        if (i > 0)
-          grid[i - 1][j] += t; // CHANGED: adds 1 grain per topple to each neighbor
-        if (j > 0)
-          grid[i][j - 1] += t; // CHANGED: adds 1 grain per topple to each neighbor
-        if (i < N - 1)
-          grid[i + 1][j] += t; // CHANGED: adds 1 grain per topple to each neighbor
-        if (j < N - 1)
-          grid[i][j + 1] += t; // CHANGED: adds 1 grain per topple to each neighbor
+        row[j] -= 4 * t; // CHANGED: removes 4 grains per topple
+        // REMOVED: removed boundary checks since edge grains now land in the padding border
+        row[j - W] += t; // CHANGED
+        row[j - 1] += t; // CHANGED
+        row[j + W] += t; // CHANGED
+        row[j + 1] += t; // CHANGED
       }
     }
   } while (changed);
@@ -126,13 +140,13 @@ static void stabilize() {
 void find_identity() {
   for (int i = 0; i < N; ++i) {
     for (int j = 0; j < N; ++j) {
-      grid[i][j] = 6;
+      grid[IDX(i, j)] = 6; // CHANGED: flat padded array idx
     }
   }
   stabilize();
   for (int i = 0; i < N; ++i) {
     for (int j = 0; j < N; ++j) {
-      grid[i][j] = 6 - grid[i][j];
+      grid[IDX(i, j)] = 6 - grid[IDX(i, j)]; // CHANGED: flat padded array idx
     }
   }
   stabilize();
@@ -150,18 +164,17 @@ int main(int argc, char **argv) {
     die("grid size must be a positive int");
   N = (int)parsed;
 
-  grid = (int **)malloc(N * sizeof(int *));
-  for (int i = 0; i < N; ++i) {
-    grid[i] = (int *)malloc(N * sizeof(int));
-  }
+  // REMOVED: mallocs for grid and each row
+  // ADDED: one alloc for the whole padded grid, calloc zeroes it so the border starts at 0
+  grid = (int*) calloc((size_t) (N + 2) * (N + 2), sizeof(int));
+  if (!grid)
+    die("calloc failed for grid");
 
   compute_shape(); // ADDED: precompute shape bounds only once
   find_identity();
 
   render("identity.png");
-  for (int i = 0; i < N; ++i) {
-    free(grid[i]);
-  }
+  // REMOVED: loop freeing each row
   free(grid);
   free(row_low); // ADDED: free shape bounds
   free(row_high); // ADDED: free shape bounds
