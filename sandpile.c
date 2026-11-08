@@ -144,6 +144,14 @@ static void stabilize() {
   const int* rlow = recv_low; // ADDED: local copy of recv bounds
   const int* rhigh = recv_high; // ADDED: local copy of recv bounds
 
+  // ADDED: the Pacman is symmetric top to bottom (row i matches row N-1-i) when N is odd,
+  // and every sweep keeps the grid symmetric, so only rows 0 to the middle row c need to be simulated
+  // to keep scope, included a fallback for even N
+  // where the middle falls between two rows and the circle isn't symmetric that way, so we do every row
+  const int sym = (N_local % 2 == 1);
+  const int c = N_local / 2; // middle row
+  const int rows = sym ? c + 1 : N_local; // # of rows to simulate
+
   int changed = 0;
   // ADDED: start the threads once for the whole stabilize instead of once per pass
   // there are hundred thousands of sweeps, so starting threads twice per sweep would add up
@@ -161,7 +169,7 @@ static void stabilize() {
       // a mix of short rows (top and bottom of the circle) and long rows (middle)
       #pragma omp for reduction(|:changed) schedule(static, 16)
 
-      for (int i = 0; i < N_local; ++i) { // CHANGED: use local copy
+      for (int i = 0; i < rows; ++i) { // CHANGED: use local copy, only top half + middle row
         int* restrict row = g + (i + 1) * W + 1; // ADDED: pointer to cell (i, 0) so row[j] is cell (i, j)
         int* restrict trow = tb + (i + 1) * W + 1; // ADDED: same for the topple counts
         const int jlow = low[i], jhigh = high[i]; // ADDED: read the row bounds once so gcc knows the trip count
@@ -187,12 +195,16 @@ static void stabilize() {
       // ADDED: each row only writes its own cells, so rows can also be split across threads here
       // the wait at the end of pass 1 makes sure all topple counts are saved before pass 2 reads them
       #pragma omp for schedule(static, 16)
-      for (int i = 0; i < N_local; ++i) {
+      for (int i = 0; i < rows; ++i) { // CHANGED: only top half + middle row
         int* restrict row = g + (i + 1) * W + 1;
         const int* restrict trow = tb + (i + 1) * W + 1;
+        const int* restrict tup = trow - W; // ADDED: topple counts of the row above
+        const int* restrict tdown = (sym && i == c) ? tup : trow + W; // ADDED: topple counts of the row below
+        // for the middle row that's row c+1, which isn't simulated, but it's the mirror of row c-1 so read that instead
         const int jlow = rlow[i], jhigh = rhigh[i];
+
         for (int j = jlow; j <= jhigh; ++j) {
-          row[j] += trow[j - W] + trow[j + W] + trow[j - 1] + trow[j + 1];
+          row[j] += tup[j] + tdown[j] + trow[j - 1] + trow[j + 1]; // CHANGED: using symmetry
         }
       }
 
@@ -215,6 +227,13 @@ void find_identity() {
     }
   }
   stabilize();
+
+  // ADDED: stabilize only filled in the top half and middle row when N is odd,
+  // so copy each bottom row from its mirror row in the top half (whole padded row at once)
+  if (N % 2 == 1) {
+    for (int i = N / 2 + 1; i < N; ++i)
+      memcpy(&grid[IDX(i, -1)], &grid[IDX(N - 1 - i, -1)], (size_t)(N + 2) * sizeof(int));
+  }
 }
 
 int main(int argc, char **argv) {
