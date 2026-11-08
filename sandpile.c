@@ -28,9 +28,16 @@ int* grid; // CHANGED: a contiguous block of (N+2)*(N+2) ints
 // so this works for disappearing grains that fall off
 #define IDX(i, j) (((i) + 1) * (N + 2) + ((j) + 1))
 
+// ADDED: topple count per cell for the current sweep, same padded layout as grid
+// only cells inside the shape are ever written, so every other entry stays 0
+static int* tbuf;
+
 // ADDED: per-row shape bound pointers
 static int* row_low;
 static int* row_high;
+// ADDED: per-row range of cells that can receive grains (shape cells + their neighbors)
+static int* recv_low;
+static int* recv_high;
 
 // ADDED: precompute shape bounds
 static void compute_shape(void) {
@@ -52,6 +59,24 @@ static void compute_shape(void) {
     }
     row_low[i] = (low < 0) ? 0 : low;
     row_high[i] = high;
+  }
+
+  // ADDED: a cell gets grains only if a neighbor is inside the shape,
+  // so pass 2 only needs columns low - 1 to high + 1 of this row and the rows above and below
+  recv_low = (int*) malloc(N * sizeof(int));
+  recv_high = (int*) malloc(N * sizeof(int));
+  if (!recv_low || !recv_high)
+    die("Malloc failed for receive bounds");
+  for (int i = 0; i < N; ++i) {
+    int low = N, high = -1; // empty by default
+    for (int k = MAX(i - 1, 0); k <= MIN(i + 1, N - 1); ++k) {
+      if (row_high[k] < row_low[k])
+        continue; // empty row
+      low = MIN(low, row_low[k] - 1);
+      high = MAX(high, row_high[k] + 1);
+    }
+    recv_low[i] = MAX(low, 0);
+    recv_high[i] = MIN(high, N - 1);
   }
 }
 
@@ -113,25 +138,43 @@ static void stabilize() {
   const int N_local = N;
   const int W = N + 2; // width of one padded row
   int* restrict g = grid; // g is the only pointer used to write the grid
+  int* restrict tb = tbuf; // ADDED: only pointer used to write the topple counts
   const int* low = row_low;
   const int* high = row_high;
+  const int* rlow = recv_low; // ADDED: local copy of recv bounds
+  const int* rhigh = recv_high; // ADDED: local copy of recv bounds
 
   int changed = 0;
   do {
     changed = 0;
+    // pass 1 decides how many times each cell topples, using only its own value
+    // so no cell depends on another cell's update in the same pass which lets gcc vectorize it
     for (int i = 0; i < N_local; ++i) { // CHANGED: use local copy
-      int* row = g + (i + 1) * W + 1; // ADDED: pointer to cell (i, 0) so row[j] is cell (i, j)
-      for (int j = low[i]; j <= high[i]; ++j) { // CHANGED: use local copy, was j = 0 to MAX(i, N-1-i) + per-cell circle test
+      int* restrict row = g + (i + 1) * W + 1; // ADDED: pointer to cell (i, 0) so row[j] is cell (i, j)
+      int* restrict trow = tb + (i + 1) * W + 1; // ADDED: same for the topple counts
+      const int jlow = low[i], jhigh = high[i]; // ADDED: read the row bounds once so gcc knows the trip count
+
+      for (int j = jlow; j <= jhigh; ++j) { // CHANGED: use local copy, was j = 0 to MAX(i, N-1-i) + per-cell circle test
         // REMOVED: unpredictable branch
 
         int t = row[j] >> 2; // ADDED: # of topples
         changed |= t; // CHANGED: topple it
         row[j] -= 4 * t; // CHANGED: removes 4 grains per topple
+        trow[j] = t; // ADDED: save t so pass 2 can hand it to neighbors
         // REMOVED: removed boundary checks since edge grains now land in the padding border
-        row[j - W] += t; // CHANGED
-        row[j - 1] += t; // CHANGED
-        row[j + W] += t; // CHANGED
-        row[j + 1] += t; // CHANGED
+        // REMOVED: also the neighbor adds which are done in pass 2
+      }
+    }
+
+    // ADDED: pass 2 gives every cell 1 grain per topple of each neighbor,
+    // reading only tbuf and writing only grid, so no cell-to-cell dependency
+    // covers shape cells and their neighbors, so cells outside the shape still collect grains like before
+    for (int i = 0; i < N_local; ++i) {
+      int* restrict row = g + (i + 1) * W + 1;
+      const int* restrict trow = tb + (i + 1) * W + 1;
+      const int jlow = rlow[i], jhigh = rhigh[i];
+      for (int j = jlow; j <= jhigh; ++j) {
+        row[j] += trow[j - W] + trow[j + W] + trow[j - 1] + trow[j + 1];
       }
     }
   } while (changed);
@@ -169,6 +212,10 @@ int main(int argc, char **argv) {
   grid = (int*) calloc((size_t) (N + 2) * (N + 2), sizeof(int));
   if (!grid)
     die("calloc failed for grid");
+  // ADDED: topple counts, calloc zeroes them so cells outside the shape always give 0
+  tbuf = (int*) calloc((size_t) (N + 2) * (N + 2), sizeof(int));
+  if (!tbuf)
+    die("calloc failed for topple buffer");
 
   compute_shape(); // ADDED: precompute shape bounds only once
   find_identity();
@@ -176,7 +223,10 @@ int main(int argc, char **argv) {
   render("identity.png");
   // REMOVED: loop freeing each row
   free(grid);
+  free(tbuf); // ADDED: free topple counts
   free(row_low); // ADDED: free shape bounds
   free(row_high); // ADDED: free shape bounds
+  free(recv_low); // ADDED: free recv bounds
+  free(recv_high); // ADDED: free recv bounds
   return EXIT_SUCCESS;
 }
