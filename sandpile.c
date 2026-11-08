@@ -145,39 +145,61 @@ static void stabilize() {
   const int* rhigh = recv_high; // ADDED: local copy of recv bounds
 
   int changed = 0;
-  do {
-    changed = 0;
-    // pass 1 decides how many times each cell topples, using only its own value
-    // so no cell depends on another cell's update in the same pass which lets gcc vectorize it
-    for (int i = 0; i < N_local; ++i) { // CHANGED: use local copy
-      int* restrict row = g + (i + 1) * W + 1; // ADDED: pointer to cell (i, 0) so row[j] is cell (i, j)
-      int* restrict trow = tb + (i + 1) * W + 1; // ADDED: same for the topple counts
-      const int jlow = low[i], jhigh = high[i]; // ADDED: read the row bounds once so gcc knows the trip count
+  // ADDED: start the threads once for the whole stabilize instead of once per pass
+  // there are hundred thousands of sweeps, so starting threads twice per sweep would add up
+  #pragma omp parallel
+  {
+    for (;;) { // CHANGED: every thread runs this loop
+      #pragma omp single
+      changed = 0; // CHANGED: one thread resets it and the rest wait at the end of single
+      
+      // pass 1 decides how many times each cell topples, using only its own value
+      // so no cell depends on another cell's update in the same pass which lets gcc vectorize it
+      // ADDED: rows are independent in this pass, so split them across threads
+      // reduction(|:changed) gives each thread its own changed and ORs them together at the end
+      // schedule(static, 16) hands out rows in chunks of 16 round robin, so every thread gets
+      // a mix of short rows (top and bottom of the circle) and long rows (middle)
+      #pragma omp for reduction(|:changed) schedule(static, 16)
 
-      for (int j = jlow; j <= jhigh; ++j) { // CHANGED: use local copy, was j = 0 to MAX(i, N-1-i) + per-cell circle test
-        // REMOVED: unpredictable branch
+      for (int i = 0; i < N_local; ++i) { // CHANGED: use local copy
+        int* restrict row = g + (i + 1) * W + 1; // ADDED: pointer to cell (i, 0) so row[j] is cell (i, j)
+        int* restrict trow = tb + (i + 1) * W + 1; // ADDED: same for the topple counts
+        const int jlow = low[i], jhigh = high[i]; // ADDED: read the row bounds once so gcc knows the trip count
 
-        int t = row[j] >> 2; // ADDED: # of topples
-        changed |= t; // CHANGED: topple it
-        row[j] -= 4 * t; // CHANGED: removes 4 grains per topple
-        trow[j] = t; // ADDED: save t so pass 2 can hand it to neighbors
-        // REMOVED: removed boundary checks since edge grains now land in the padding border
-        // REMOVED: also the neighbor adds which are done in pass 2
+        for (int j = jlow; j <= jhigh; ++j) { // CHANGED: use local copy, was j = 0 to MAX(i, N-1-i) + per-cell circle test
+          // REMOVED: unpredictable branch
+
+          int t = row[j] >> 2; // ADDED: # of topples
+          changed |= t; // CHANGED: topple it
+          row[j] -= 4 * t; // CHANGED: removes 4 grains per topple
+          trow[j] = t; // ADDED: save t so pass 2 can hand it to neighbors
+          // REMOVED: removed boundary checks since edge grains now land in the padding border
+          // REMOVED: also the neighbor adds which are done in pass 2
+        }
       }
-    }
+      // ADDED: every thread copies the final changed now (all threads wait at the end of pass 1
+      // so it's complete) and reading it after pass 2 instead could race with the next sweep resetting it
+      const int any_toppled = changed;
 
-    // ADDED: pass 2 gives every cell 1 grain per topple of each neighbor,
-    // reading only tbuf and writing only grid, so no cell-to-cell dependency
-    // covers shape cells and their neighbors, so cells outside the shape still collect grains like before
-    for (int i = 0; i < N_local; ++i) {
-      int* restrict row = g + (i + 1) * W + 1;
-      const int* restrict trow = tb + (i + 1) * W + 1;
-      const int jlow = rlow[i], jhigh = rhigh[i];
-      for (int j = jlow; j <= jhigh; ++j) {
-        row[j] += trow[j - W] + trow[j + W] + trow[j - 1] + trow[j + 1];
+      // ADDED: pass 2 gives every cell 1 grain per topple of each neighbor,
+      // reading only tbuf and writing only grid, so no cell-to-cell dependency
+      // covers shape cells and their neighbors, so cells outside the shape still collect grains like before
+      // ADDED: each row only writes its own cells, so rows can also be split across threads here
+      // the wait at the end of pass 1 makes sure all topple counts are saved before pass 2 reads them
+      #pragma omp for schedule(static, 16)
+      for (int i = 0; i < N_local; ++i) {
+        int* restrict row = g + (i + 1) * W + 1;
+        const int* restrict trow = tb + (i + 1) * W + 1;
+        const int jlow = rlow[i], jhigh = rhigh[i];
+        for (int j = jlow; j <= jhigh; ++j) {
+          row[j] += trow[j - W] + trow[j + W] + trow[j - 1] + trow[j + 1];
+        }
       }
+
+      if (!any_toppled) // CHANGED: replaced while, every thread sees the same value so they all stop together
+        break;
     }
-  } while (changed);
+  }
 }
 
 void find_identity() {
